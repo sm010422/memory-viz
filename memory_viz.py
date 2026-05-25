@@ -72,10 +72,19 @@ const PALETTE=[
 ];
 const colorMap={};
 let palIdx=0;
+const CELLS=240;
 
-function getColor(name){
-  if(!colorMap[name]){colorMap[name]=PALETTE[palIdx%PALETTE.length];palIdx++;}
-  return colorMap[name];
+// 영구 레이아웃: 한번 할당된 자리는 고정
+// layout[pid] = { cells: Set<idx>, info: {...} }
+const layout={};
+// 각 셀이 어떤 pid 소유인지 (null=free, 'wired'/'inactive'/'compressed'=시스템)
+const cellOwner=new Array(CELLS).fill(null);
+let gridBuilt=false;
+let knownPids=new Set();
+
+function getColor(pid){
+  if(!colorMap[pid]){colorMap[pid]=PALETTE[palIdx%PALETTE.length];palIdx++;}
+  return colorMap[pid];
 }
 
 async function fetchData(){
@@ -85,10 +94,60 @@ async function fetchData(){
     update(d);
     document.getElementById('status').textContent='● 실시간';
     document.getElementById('status').style.animation='none';
-    document.getElementById('status').style.color='#1D9E75';
+    document.getElementById('status').style.color='#2DC98E';
   }catch(e){
     document.getElementById('status').textContent='● 연결 끊김';
-    document.getElementById('status').style.color='#E24B4A';
+    document.getElementById('status').style.color='#F07070';
+  }
+}
+
+function buildGrid(){
+  const grid=document.getElementById('grid');
+  grid.innerHTML='';
+  for(let i=0;i<CELLS;i++){
+    const div=document.createElement('div');
+    div.className='cell';div.id='cell-'+i;
+    div.addEventListener('mouseenter',()=>{
+      const owner=cellOwner[i];
+      const tip=document.getElementById('tip');
+      if(!owner) tip.textContent='빈 페이지 (free)';
+      else if(owner==='wired') tip.textContent='wired — 커널 고정 메모리 (절대 스왑 불가)';
+      else if(owner==='inactive') tip.textContent='inactive — 최근 미사용, 스왑 대상';
+      else if(owner==='compressed') tip.textContent='compressed — macOS가 압축한 페이지';
+      else{
+        const l=layout[owner];
+        tip.textContent=l?`${l.name}  PID ${owner}  RSS ${l.rss}  ${l.cells.size}페이지 점유`:'';
+      }
+    });
+    grid.appendChild(div);
+  }
+  gridBuilt=true;
+}
+
+// 빈 셀 중 count개 찾아서 반환
+function findFreeCells(count){
+  const free=[];
+  for(let i=0;i<CELLS&&free.length<count;i++){
+    if(!cellOwner[i]) free.push(i);
+  }
+  return free;
+}
+
+function renderCell(idx){
+  const el=document.getElementById('cell-'+idx);
+  if(!el) return;
+  const owner=cellOwner[idx];
+  if(!owner){
+    el.style.background='#1a1a20';el.style.borderColor='#252530';
+  } else if(owner==='wired'){
+    el.style.background='#1e1430';el.style.borderColor='#4a2a7a';
+  } else if(owner==='inactive'){
+    el.style.background='#141e16';el.style.borderColor='#1e3020';
+  } else if(owner==='compressed'){
+    el.style.background='#201e10';el.style.borderColor='#403a10';
+  } else {
+    const[s,f]=getColor(owner);
+    el.style.background=f;el.style.borderColor=s+'cc';
   }
 }
 
@@ -97,51 +156,102 @@ function update(d){
   document.getElementById('s-used').textContent=d.used_pct.toFixed(1)+'%';
   document.getElementById('s-free').textContent=(100-d.used_pct).toFixed(1)+'%';
   document.getElementById('s-procs').textContent=d.procs.length;
+  if(!gridBuilt) buildGrid();
 
-  const CELLS=200;
-  const pages=[];
-  const top=d.procs.slice(0,12);
-  for(const p of top){
-    const cnt=Math.max(1,Math.round((p.mem/100)*CELLS));
-    for(let i=0;i<cnt;i++)pages.push(p);
+  // 시스템 구역(wired/inactive/compressed)은 처음 한번만 칠하기
+  const seg=d.segments||{wired:0.1,active:0.5,inactive:0.1,compressed:0.05};
+  if(!window._segInit){
+    window._segInit=true;
+    const wiredN =Math.round((seg.wired||0)*CELLS);
+    const inactN =Math.round((seg.inactive||0)*CELLS);
+    const compN  =Math.round((seg.compressed||0)*CELLS);
+    // wired: 앞쪽
+    for(let i=0;i<wiredN;i++){cellOwner[i]='wired';renderCell(i);}
+    // inactive: 뒤쪽
+    const inactStart=CELLS-compN-inactN;
+    for(let i=inactStart;i<inactStart+inactN;i++){cellOwner[i]='inactive';renderCell(i);}
+    // compressed: 맨 뒤
+    const compStart=CELLS-compN;
+    for(let i=compStart;i<CELLS;i++){cellOwner[i]='compressed';renderCell(i);}
   }
-  const free=Math.max(0,CELLS-pages.length);
-  for(let i=0;i<free;i++)pages.push(null);
-  for(let i=pages.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[pages[i],pages[j]]=[pages[j],pages[i]];}
 
-  const grid=document.getElementById('grid');
-  const cells=grid.querySelectorAll('.cell');
-  if(cells.length!==CELLS){
-    grid.innerHTML='';
-    for(let i=0;i<CELLS;i++){
-      const div=document.createElement('div');div.className='cell';
-      div.addEventListener('mouseenter',()=>{
-        const p=pages[i];
-        document.getElementById('tip').textContent=p?`${p.name} (PID ${p.pid}) — RSS ${p.rss}`:'빈 페이지 (free)';
-      });
-      grid.appendChild(div);
+  const top=d.procs.slice(0,12);
+  const currentPids=new Set(top.map(p=>p.pid));
+
+  // 1. 사라진 프로세스 → 셀 해제 (실제 free처럼 구멍이 생김)
+  for(const pid of knownPids){
+    if(!currentPids.has(pid)&&layout[pid]){
+      for(const idx of layout[pid].cells){
+        cellOwner[idx]=null;
+        renderCell(idx);
+      }
+      delete layout[pid];
     }
   }
-  const allCells=grid.querySelectorAll('.cell');
-  pages.forEach((p,i)=>{
-    const el=allCells[i];
-    if(p){const[s,f]=getColor(p.name);el.style.background=f;el.style.borderColor=s+'99';}
-    else{el.style.background='#222228';el.style.borderColor='#2e2e38';}
-  });
 
-  const legend=document.getElementById('legend');
-  legend.innerHTML='<div class="li"><div class="ld" style="background:#222228;border:0.5px solid #2e2e38"></div><span>빈 페이지</span></div>';
+  // 2. 각 프로세스 처리
+  const totalMem=top.reduce((s,p)=>s+p.mem,0)||1;
+  const activeN=Math.round((seg.active||0.5)*CELLS);
+
   for(const p of top){
-    const[s,f]=getColor(p.name);
+    const target=Math.max(1,Math.round((p.mem/totalMem)*activeN));
+
+    if(!layout[p.pid]){
+      // 신규 프로세스: 빈 자리에 할당
+      const free=findFreeCells(target);
+      const cells=new Set(free);
+      layout[p.pid]={name:p.name,rss:p.rss,cells};
+      for(const idx of cells){cellOwner[idx]=p.pid;renderCell(idx);}
+    } else {
+      // 기존 프로세스: 정보만 업데이트, 위치는 유지
+      layout[p.pid].rss=p.rss;
+      layout[p.pid].name=p.name;
+      const cur=layout[p.pid].cells.size;
+      const diff=target-cur;
+
+      if(diff>2){
+        // 메모리 증가 → 빈 셀 추가 할당
+        const extra=findFreeCells(diff);
+        for(const idx of extra){
+          layout[p.pid].cells.add(idx);
+          cellOwner[idx]=p.pid;
+          renderCell(idx);
+        }
+      } else if(diff<-2){
+        // 메모리 감소 → 일부 셀 해제 (앞에서부터)
+        const toFree=[...layout[p.pid].cells].slice(0,-diff);
+        for(const idx of toFree){
+          layout[p.pid].cells.delete(idx);
+          cellOwner[idx]=null;
+          renderCell(idx);
+        }
+      }
+    }
+  }
+
+  knownPids=currentPids;
+
+  // 범례
+  const legend=document.getElementById('legend');
+  legend.innerHTML=`
+    <div class="li"><div class="ld" style="background:#1e1430;border:0.5px solid #4a2a7a"></div><span>wired</span></div>
+    <div class="li"><div class="ld" style="background:#141e16;border:0.5px solid #1e3020"></div><span>inactive</span></div>
+    <div class="li"><div class="ld" style="background:#201e10;border:0.5px solid #403a10"></div><span>compressed</span></div>
+    <div class="li"><div class="ld" style="background:#1a1a20;border:0.5px solid #252530"></div><span>free</span></div>
+  `;
+  for(const p of top){
+    if(!colorMap[p.pid]) getColor(p.pid);
+    const[s,f]=colorMap[p.pid];
     const li=document.createElement('div');li.className='li';
-    li.innerHTML=`<div class="ld" style="background:${f};border:0.5px solid ${s}"></div><span>${p.name}</span>`;
+    li.innerHTML=`<div class="ld" style="background:${f};border:0.5px solid ${s}"></div><span>${p.name} <span style="color:#555;font-size:10px">${p.pid}</span></span>`;
     legend.appendChild(li);
   }
 
+  // 프로세스 테이블
   const tbody=document.getElementById('proc-tbody');
   tbody.innerHTML='';
   for(const p of d.procs.slice(0,15)){
-    const[s,f]=getColor(p.name);
+    const[s,f]=getColor(p.pid);
     const tr=document.createElement('tr');
     const w=Math.min(100,p.mem*3).toFixed(1);
     tr.innerHTML=`
@@ -173,16 +283,25 @@ def get_vm_stat():
                 k, v = line.split(':', 1)
                 stats[k.strip()] = int(v.strip().rstrip('.'))
         page = 16384
-        free = stats.get('Pages free', 0) * page
-        active = stats.get('Pages active', 0) * page
-        inactive = stats.get('Pages inactive', 0) * page
-        wired = stats.get('Pages wired down', 0) * page
-        compressed = stats.get('Pages occupied by compressor', 0) * page
-        total = free + active + inactive + wired + compressed
-        used = active + wired + compressed
-        return total / (1024**3), (used / total * 100) if total else 0
+        free_p     = stats.get('Pages free', 0)
+        active_p   = stats.get('Pages active', 0)
+        inactive_p = stats.get('Pages inactive', 0)
+        wired_p    = stats.get('Pages wired down', 0)
+        comp_p     = stats.get('Pages occupied by compressor', 0)
+        total_p    = free_p + active_p + inactive_p + wired_p + comp_p
+        total_gb   = (total_p * page) / (1024**3)
+        used       = active_p + wired_p + comp_p
+        used_pct   = (used / total_p * 100) if total_p else 0
+        segments = {
+            "wired":      round(wired_p / total_p, 4) if total_p else 0,
+            "active":     round(active_p / total_p, 4) if total_p else 0,
+            "inactive":   round(inactive_p / total_p, 4) if total_p else 0,
+            "compressed": round(comp_p / total_p, 4) if total_p else 0,
+            "free":       round(free_p / total_p, 4) if total_p else 0,
+        }
+        return total_gb, used_pct, segments
     except:
-        return 8.0, 60.0
+        return 8.0, 60.0, {"wired":0.1,"active":0.5,"inactive":0.1,"compressed":0.05,"free":0.25}
 
 def get_procs():
     r = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
@@ -211,9 +330,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/data':
             now = time.time()
             if now - cache['ts'] > 1.8 or not cache['data']:
-                total_gb, used_pct = get_vm_stat()
+                total_gb, used_pct, segments = get_vm_stat()
                 procs = get_procs()
-                cache['data'] = json.dumps({"total_gb": total_gb, "used_pct": used_pct, "procs": procs})
+                cache['data'] = json.dumps({"total_gb": total_gb, "used_pct": used_pct, "segments": segments, "procs": procs})
                 cache['ts'] = now
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
